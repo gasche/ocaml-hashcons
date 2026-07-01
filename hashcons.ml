@@ -25,102 +25,277 @@ let gentag =
   let r = ref 0 in
   fun () -> incr r; !r
 
+(* Enable this boolean to get performance information
+   during program execution and on program exit. *)
+let verbose = false
+
+(* H.t is a representation of hashes as stored within the [hashes]
+   array below. We reserve 0 to denote a distinguished 'void' value
+   which corresponds to the absence of a key in this position.
+
+   Note: François Pottier's implementation
+   ( https://github.com/fpottier/hachis/ ) also contains
+   a distinguished 'tomb' value for slots whose key has been removed
+   (Hashtbl.remove). For hash-consing we do not need to handle
+   explicit removal; we could use tombstones for keys that get erased
+   by the GC, but we just leave the hashes around until the next
+   resizing or compression.
+*)
+module H : sig
+  type t = private int
+  val void : t
+  val of_int : int -> t
+end = struct
+  type t = int
+  let void = 0
+  let of_int x =
+    if x = void then void + 1 else x
+end
+
 type 'a t = {
-  mutable table : 'a hash_consed Weak.t array;
-  mutable totsize : int;             (* sum of the bucket sizes *)
-  mutable limit : int;               (* max ratio totsize/table length *)
+  mutable hashes : H.t array;
+  mutable keys : 'a hash_consed Weak.t;
+  mutable occupation : int;
+  mutable mask : int; (* Array.length hashes - 1
+    (note: the length must be a power of two) *)
+  travel : int ref;
 }
 
 let create sz =
-  let sz = if sz < 7 then 7 else sz in
-  let sz = if sz > Sys.max_array_length then Sys.max_array_length else sz in
-  let emptybucket = Weak.create 0 in
-  { table = Array.make sz emptybucket;
-    totsize = 0;
-    limit = 3; }
+  (* We need to guarantee that there is always at least one [void]
+     slot for search to terminate, so [sz] must be at least 1.
+     We also guarantee that sizes are always a power of 2,
+     to compute the modulo efficiently. *)
+  let sz' = ref 1 in
+  while !sz' < sz do sz' := 2 * !sz' done;
+  let sz = !sz' in
+  {
+    hashes = Array.make sz H.void;
+    keys = Weak.create sz;
+    occupation = 0;
+    mask = sz - 1;
+    travel = ref 0;
+  }
 
 let clear t =
-  let emptybucket = Weak.create 0 in
-  for i = 0 to Array.length t.table - 1 do t.table.(i) <- emptybucket done;
-  t.totsize <- 0;
-  t.limit <- 3
+  Weak.fill t.keys 0 (Weak.length t.keys) None;
+  Array.fill t.hashes 0 (Array.length t.hashes) H.void;
+  t.occupation <- 0
 
 let iter f t =
-  let rec iter_bucket i b =
-    if i >= Weak.length b then () else
-      match Weak.get b i with
-	| Some v -> f v; iter_bucket (i+1) b
-	| None -> iter_bucket (i+1) b
+  let len = Array.length t.hashes in
+  for i = 0 to len - 1 do
+    match Weak.get t.keys i with
+    | None -> ()
+    | Some hc -> f hc
+  done
+
+let locate_calls = ref 0
+let locate_travel = ref 0
+
+let () = if verbose then at_exit (fun () ->
+  Printf.eprintf "Hashcons locate: calls %d, average travel %g/call\n%!"
+    !locate_calls
+    (float !locate_travel /. float !locate_calls)
+)
+
+let rec locate_gen ~equal t k h =
+  if verbose then incr locate_calls;
+  let i = h land t.mask in
+  locate_gen_loop
+    ~equal ~mask:t.mask ~travel:t.travel
+    t.keys k t.hashes (H.of_int h) i
+and locate_gen_loop ~equal ~mask ~travel keys k hashes h i =
+  incr travel;
+  if verbose then incr locate_travel;
+  let h' = Array.unsafe_get hashes i in
+  let i' = (i + 1) land mask in
+  if h' <> h then
+    if h' = H.void then Error i
+    else locate_gen_loop ~equal ~mask ~travel keys k hashes h i'
+  else
+    match Weak.get keys i with
+    | Some hc when equal k hc.node -> Ok hc
+    | _ ->
+      (* When a value has been erased by the GC (case [None]), we must
+         keep looking further for another value with the same hash. It
+         would be incorrect to treat it as a [void] hash, for the same
+         reason that François distinguishes [tomb] from [void]. *)
+      locate_gen_loop ~equal ~mask ~travel keys k hashes h i'
+
+let next_sz n = min (2*n) (Sys.max_array_length / 2)
+
+let resize_count = ref 0
+
+let resize_gen ~equal t =
+  if verbose then incr resize_count;
+  let old_occupation = t.occupation in
+  let old_capacity = Array.length t.hashes in
+  let old_hashes, old_keys = t.hashes, t.keys in
+  let new_capacity = next_sz old_capacity in
+  let new_mask = new_capacity - 1 in
+  let new_hashes, new_keys =
+    Array.make new_capacity H.void,
+    Weak.create new_capacity
   in
-  Array.iter (iter_bucket 0) t.table
-
-let count t =
-  let rec count_bucket i b accu =
-    if i >= Weak.length b then accu else
-      count_bucket (i+1) b (accu + (if Weak.check b i then 1 else 0))
-  in
-  Array.fold_right (count_bucket 0) t.table 0
-
-let next_sz n = min (3*n/2 + 3) (Sys.max_array_length - 1)
-
-let rec resize t =
-  let oldlen = Array.length t.table in
-  let newlen = next_sz oldlen in
-  if newlen > oldlen then begin
-    let newt = create newlen in
-    newt.limit <- t.limit + 100;          (* prevent resizing of newt *)
-    iter (fun d -> add newt d) t;
-    t.table <- newt.table;
-    t.totsize <- newt.totsize
-  end
-
-and add t d =
-  let index = d.hkey mod (Array.length t.table) in
-  let bucket = t.table.(index) in
-  let sz = Weak.length bucket in
-  let i = ref 0 in
-  while !i < sz && Weak.check bucket !i do incr i done;
-  if !i < sz then
-    Weak.set bucket !i (Some d)
-  else begin
-    let newsz = min (3 * sz / 2 + 3) (Sys.max_array_length - 1) in
-    if newsz <= sz then
-      failwith "Hashcons.Make: hash bucket cannot grow more";
-    let newbucket = Weak.create newsz in
-    Weak.blit bucket 0 newbucket 0 sz;
-    Weak.set newbucket sz (Some d);
-    t.table.(index) <- newbucket;
-    t.totsize <- t.totsize + (newsz - sz);
-    if t.totsize > t.limit * Array.length t.table then resize t;
-  end
-
-let hashcons t d =
-  let hkey = Hashtbl.hash d land max_int in
-  let index = hkey mod (Array.length t.table) in
-  let bucket = t.table.(index) in
-  let sz = Weak.length bucket in
-  let found = ref None in
-  let i = ref 0 in
-  while !i < sz && Option.is_none !found do
-    match Weak.get bucket !i with
-    | Some v as opt when v.hkey = hkey && v.node = d ->
-      found := opt
-    | _ -> incr i
+  t.hashes <- new_hashes;
+  t.keys <- new_keys;
+  t.mask <- new_mask;
+  t.occupation <- 0;
+  for i = 0 to old_capacity - 1 do
+    match Weak.get old_keys i with
+    | None -> ()
+    | Some hc ->
+      let h = Array.unsafe_get old_hashes i in
+      match locate_gen ~equal t hc.node hc.hkey with
+      | Ok _ ->
+        failwith "resize: key already in the table?";
+      | Error i ->
+        t.occupation <- t.occupation + 1;
+        Weak.set new_keys i (Some hc);
+        new_hashes.(i) <- h;
   done;
-  match !found with
-  | Some v -> v
-  | None ->
-    let hnode = { hkey = hkey; tag = gentag (); node = d } in
-    add t hnode;
-    hnode
+  let new_occupation = t.occupation in
+  if verbose then
+    Printf.eprintf "[%.2d] Resize: size %d=>%d, occupation %d=>%d\n%!"
+      !resize_count
+      old_capacity new_capacity
+      old_occupation new_occupation;
+  ()
+
+let compress ~equal t =
+  if verbose then incr resize_count;
+  let old_occupation = t.occupation in
+  let first_void = Array.find_index ((=) H.void) t.hashes |> Option.get in
+  let len = Array.length t.hashes in
+  for i = 0 to len - 1 do
+    let i = (first_void + i) mod len in
+    if t.hashes.(i) <> H.void then
+      match Weak.get t.keys i with
+      | None ->
+        t.occupation <- t.occupation - 1;
+        t.hashes.(i) <- H.void;
+      | Some hc ->
+        match locate_gen ~equal t hc.node hc.hkey with
+        | Ok _ -> ()
+        | Error j ->
+          Weak.set t.keys j (Some hc);
+          Weak.set t.keys i None;
+          t.hashes.(j) <- t.hashes.(i);
+          t.hashes.(i) <- H.void;
+  done;
+  let new_occupation = t.occupation in
+  if verbose then
+    Printf.eprintf "[%.2d] Compression: occupation %d=>%d\n%!"
+      !resize_count old_occupation new_occupation;
+  ()
+
+let[@inline] capacity t =
+  t.mask + 1
+
+let crowded t =
+  (* resize at 82% occupation (105/128);
+     from François Pottier's [hachis] library. *)
+  128 * t.occupation > 105 * capacity t
+
+let calls = ref 0
+let hits = ref 0
+let misses = ref 0
+let () = if verbose then at_exit (fun () ->
+  let ratio n = 100. *. float n /. float !calls in
+  Printf.eprintf "Hachcons calls %d: hits %d (%g%%), misses %d (%g%%).\n%!"
+    !calls
+    !hits (ratio !hits)
+    !misses (ratio !misses)
+)
+
+let hashcons_gen ~hash ~equal t k =
+  if verbose then incr calls;
+  if crowded t then begin
+    (* Our estimation of occupation does not take into account weak
+       keys that have been removed by the GC. When the occupation
+       becomes high and we consider resizing, we first loook at
+       whether the real occupation is low enough that no resizing is
+       necessary -- in this case we just compress the data in-place,
+       without moving to larger backing arrays. *)
+    let real_occupation =
+      let count = ref 0 in
+      iter (fun _ -> incr count) t;
+      !count
+    in
+    if real_occupation < capacity t / 2
+    then compress ~equal t
+    else resize_gen ~equal t;
+    t.travel := 0;
+  end
+  else if !(t.travel) > 42 * capacity t then begin
+    (* In workloads where hits dominate misses, the table grows very
+       slowly, so the crowded criterion rarely applies. It remains
+       useful to compress it from time to time, to get a chance to
+       remove collected values and thus speedup future lookups.
+
+       To compress regularly, we measure the 'travel' caused by
+       lookups, the total number of positions they have visited since
+       the last resizing or compression. When they have visited many
+       times the total size of the structure, we have amortized the
+       cost of a compression.
+
+       On [test_qs.ml] from the [ocaml-hashcons] repository (99.8%
+       hit rate), this extra source of compression reduces average
+       lookup travel from 5.4 to 1.3, and runtime is reduced from 1.7s
+       to 1.3s. *)
+    compress ~equal t;
+    t.travel := 0;
+  end;
+  let h = hash k land max_int in
+  match locate_gen ~equal t k h with
+  | Ok hc ->
+    if verbose then incr hits;
+    hc
+  | Error i ->
+    if verbose then incr misses;
+    let hc = { hkey = h; tag = gentag (); node = k } in
+    Weak.set t.keys i (Some hc);
+    Array.unsafe_set t.hashes i (H.of_int h);
+    t.occupation <- t.occupation + 1;
+    hc
 
 let stats t =
-  let len = Array.length t.table in
-  let lens = Array.map Weak.length t.table in
-  Array.sort compare lens;
-  let totlen = Array.fold_left ( + ) 0 lens in
-  (len, count t, totlen, lens.(0), lens.(len/2), lens.(len-1))
+  (* len: number of non-void hashes. *)
+  let len = t.occupation in
+  (* count: number of live keys *)
+  let count =
+    let i = ref 0 in iter (fun _ -> incr i) t; !i in
+  (* totlen: total capacity *)
+  let totlen = Array.length t.hashes in
+  (* For the statistical information that used to correspond to bucket
+     sizes, we compute the size of filled intervals in-between void
+     keys. *)
+  let interval_lens =
+    let voids = ref [] in
+    Array.iteri (fun i h -> if h == H.void then voids := i :: !voids) t.hashes;
+    let voids = Array.of_list (List.rev !voids) in
+    List.init (Array.length voids - 1) (fun i ->
+      if i < Array.length voids - 1 then
+        voids.(i + 1) - voids.(i) - 1
+      else
+        Array.length t.hashes - voids.(i) - 1
+        + voids.(0)
+    )
+    |> List.filter ((<>) 0) (* filter out empty gaps *)
+    |> Array.of_list
+  in
+  let nb_intervals = Array.length interval_lens in
+  Array.sort compare interval_lens;
+  (len, count, totlen,
+   interval_lens.(0),
+   interval_lens.(nb_intervals / 2),
+   interval_lens.(nb_intervals - 1))
 
+(* Specialized definitions with Stdlib's hashing and comparison. *)
+
+let hashcons t k =
+  hashcons_gen ~hash:Hashtbl.hash ~equal:(=) t k
 
 (* Functorial interface *)
 
@@ -142,112 +317,15 @@ module type S =
     val stats : t -> int * int * int * int * int * int
   end
 
-module Make(H : HashedType) : (S with type key = H.t) = struct
+module Make(K : HashedType) : (S with type key = K.t) = struct
+  type key = K.t
+  type nonrec t = K.t t
 
-  type key = H.t
-
-  type data = H.t hash_consed
-
-  type t = {
-    mutable table : data Weak.t array;
-    mutable totsize : int;             (* sum of the bucket sizes *)
-    mutable limit : int;               (* max ratio totsize/table length *)
-  }
-
-  let emptybucket = Weak.create 0
-
-  let create sz =
-    let sz = if sz < 7 then 7 else sz in
-    let sz = if sz > Sys.max_array_length then Sys.max_array_length else sz in
-    {
-      table = Array.make sz emptybucket;
-      totsize = 0;
-      limit = 3;
-    }
-
-  let clear t =
-    for i = 0 to Array.length t.table - 1 do
-      t.table.(i) <- emptybucket
-    done;
-    t.totsize <- 0;
-    t.limit <- 3
-
-  let iter f t =
-    let rec iter_bucket i b =
-      if i >= Weak.length b then () else
-      match Weak.get b i with
-      | Some v -> f v; iter_bucket (i+1) b
-      | None -> iter_bucket (i+1) b
-    in
-    Array.iter (iter_bucket 0) t.table
-
-  let count t =
-    let rec count_bucket i b accu =
-      if i >= Weak.length b then accu else
-      count_bucket (i+1) b (accu + (if Weak.check b i then 1 else 0))
-    in
-    Array.fold_right (count_bucket 0) t.table 0
-
-  let next_sz n = min (3*n/2 + 3) (Sys.max_array_length - 1)
-
-  let rec resize t =
-    let oldlen = Array.length t.table in
-    let newlen = next_sz oldlen in
-    if newlen > oldlen then begin
-      let newt = create newlen in
-      newt.limit <- t.limit + 100;          (* prevent resizing of newt *)
-      iter (fun d -> add newt d) t;
-      t.table <- newt.table;
-      t.totsize <- newt.totsize
-    end
-
-  and add t d =
-    let index = d.hkey mod (Array.length t.table) in
-    let bucket = t.table.(index) in
-    let sz = Weak.length bucket in
-    let i = ref 0 in
-    while !i < sz && Weak.check bucket !i do incr i done;
-    if !i < sz then
-      Weak.set bucket !i (Some d)
-    else begin
-      let newsz = min (3 * sz / 2 + 3) (Sys.max_array_length - 1) in
-      if newsz <= sz then
-        failwith "Hashcons.Make: hash bucket cannot grow more";
-      let newbucket = Weak.create newsz in
-      Weak.blit bucket 0 newbucket 0 sz;
-      Weak.set newbucket sz (Some d);
-      t.table.(index) <- newbucket;
-      t.totsize <- t.totsize + (newsz - sz);
-      if t.totsize > t.limit * Array.length t.table then resize t;
-    end
-
-  let hashcons t d =
-    let hkey = H.hash d land max_int in
-    let index = hkey mod (Array.length t.table) in
-    let bucket = t.table.(index) in
-    let sz = Weak.length bucket in
-    let found = ref None in
-    let i = ref 0 in
-    while !i < sz && Option.is_none !found do
-      match Weak.get bucket !i with
-      | Some v as opt when v.hkey = hkey && H.equal v.node d ->
-        found := opt
-      | _ -> incr i
-    done;
-    match !found with
-    | Some v -> v
-    | None ->
-      let hnode = { hkey = hkey; tag = gentag (); node = d } in
-      add t hnode;
-      hnode
-
-  let stats t =
-    let len = Array.length t.table in
-    let lens = Array.map Weak.length t.table in
-    Array.sort compare lens;
-    let totlen = Array.fold_left ( + ) 0 lens in
-    (len, count t, totlen, lens.(0), lens.(len/2), lens.(len-1))
-
+  let create = create
+  let clear = clear
+  let hashcons t k = hashcons_gen ~hash:K.hash ~equal:K.equal t k
+  let iter = iter
+  let stats = stats
 end
 
 

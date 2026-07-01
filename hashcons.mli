@@ -87,7 +87,7 @@ module type S =
     val stats : t -> int * int * int * int * int * int
   end
 
-module Make(H : HashedType) : (S with type key = H.t)
+module Make(K : HashedType) : (S with type key = K.t)
 
 
 module Hmap : sig

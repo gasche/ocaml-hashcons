@@ -178,7 +178,7 @@ let () =
   let l = list [0;3;5;2;4;1] in
   assert (normal_list (app (quicksort, l)) = [0;1;2;3;4;5]);
   printf "subst count: %d@." !subst_count;
-  let stat = Gc.stat () in
+  let stat = Gc.quick_stat () in
   printf "top heap words: %d (%d kb)@." stat.Gc.top_heap_words
     (stat.Gc.top_heap_words / 256);
   let l,n,s,b1,b2,b3 = Term.stats ht in
