@@ -13,6 +13,11 @@
  (libraries hashcons))
 
 (test
+ (name bench_bdd)
+ (modules bench_bdd)
+ (libraries hashcons))
+
+(test
  (name test_qs)
  (modules test_qs)
  (flags ())
