@@ -49,6 +49,35 @@ end = struct
   type t = int
   let void = 0
   let of_int x =
+    (* Open-adressing hashtables need hash values that are "random
+       enough" so that void elements are spread almost-randomly, to
+       avoid long sequences of consecutive non-void elements. In this
+       respect they are more sensitive than array-of-bucket designs.
+
+       For example, if you consider the set of consecutive integers
+       range [0,999], then (i -> i mod 500) is a reasonable hash
+       function for an array-of-bucket design, you will get two
+       conflict per hash and thus exactly two elements per bucket. But
+       with an open-adressing hashable, it would give terrible
+       results: if elements get added in order, when element '500'
+       gets added all slots [0,499] will already be taken, so it will
+       travel 500 steps until position 500, and similarly all other
+       integers in [500,999] will be 500 position away from their
+       hash.
+
+       Getting such a consecutive range of hashes with overlaps is
+       unfortunately relatively with common hand-written,
+       user-provided hash functions, for example one that sends the
+       pair (x, y) to the hash (alpha * x + y). These functions would
+       provide good performance with an array-of-bucket
+       implementation, but can result in catastrophic travel
+       statistics for open-addressing schemes.
+
+       To avoid this issue, we multiply the hashes by a large prime
+       number (found in hash.c, the C implementation of hashing in the
+       OCaml runtime), which will 'spread' consecutive integers to
+       a much larger range with gaps between them. *)
+    let x = x * 0xcc9e2d51 in
     if x = void then void + 1 else x
 end
 
@@ -101,10 +130,10 @@ let () = if verbose then at_exit (fun () ->
 
 let rec locate_gen ~equal t k h =
   if verbose then incr locate_calls;
-  let i = h land t.mask in
+  let i = (h : H.t :> int) land t.mask in
   locate_gen_loop
     ~equal ~mask:t.mask ~travel:t.travel
-    t.keys k t.hashes (H.of_int h) i
+    t.keys k t.hashes h i
 and locate_gen_loop ~equal ~mask ~travel keys k hashes h i =
   incr travel;
   if verbose then incr locate_travel;
@@ -147,7 +176,7 @@ let resize_gen ~equal t =
     | None -> ()
     | Some hc ->
       let h = Array.unsafe_get old_hashes i in
-      match locate_gen ~equal t hc.node hc.hkey with
+      match locate_gen ~equal t hc.node h with
       | Ok _ ->
         failwith "resize: key already in the table?";
       | Error i ->
@@ -170,13 +199,14 @@ let compress ~equal t =
   let len = Array.length t.hashes in
   for i = 0 to len - 1 do
     let i = (first_void + i) mod len in
-    if t.hashes.(i) <> H.void then
+    let h = t.hashes.(i) in
+    if h <> H.void then
       match Weak.get t.keys i with
       | None ->
         t.occupation <- t.occupation - 1;
         t.hashes.(i) <- H.void;
       | Some hc ->
-        match locate_gen ~equal t hc.node hc.hkey with
+        match locate_gen ~equal t hc.node h with
         | Ok _ -> ()
         | Error j ->
           Weak.set t.keys j (Some hc);
@@ -247,16 +277,17 @@ let hashcons_gen ~hash ~equal t k =
     compress ~equal t;
     t.travel := 0;
   end;
-  let h = hash k land max_int in
+  let hkey = hash k in
+  let h = H.of_int hkey in
   match locate_gen ~equal t k h with
   | Ok hc ->
     if verbose then incr hits;
     hc
   | Error i ->
     if verbose then incr misses;
-    let hc = { hkey = h; tag = gentag (); node = k } in
+    let hc = { hkey; tag = gentag (); node = k } in
     Weak.set t.keys i (Some hc);
-    Array.unsafe_set t.hashes i (H.of_int h);
+    Array.unsafe_set t.hashes i h;
     t.occupation <- t.occupation + 1;
     hc
 
