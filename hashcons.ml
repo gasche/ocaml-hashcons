@@ -133,24 +133,31 @@ let rec locate_gen ~equal t k h =
   let i = (h : H.t :> int) land t.mask in
   locate_gen_loop
     ~equal ~mask:t.mask ~travel:t.travel
-    t.keys k t.hashes h i
-and locate_gen_loop ~equal ~mask ~travel keys k hashes h i =
+    t.keys k t.hashes h ~first_dead:(-1) i
+and locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i =
   incr travel;
   if verbose then incr locate_travel;
   let h' = Array.unsafe_get hashes i in
   let i' = (i + 1) land mask in
   if h' <> h then
-    if h' = H.void then Error i
-    else locate_gen_loop ~equal ~mask ~travel keys k hashes h i'
+    if h' = H.void then begin
+      let i = if first_dead < 0 then i else first_dead in
+      Error (i, first_dead < 0)
+    end
+    else locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i'
   else
     match Weak.get keys i with
     | Some hc when equal k hc.node -> Ok hc
-    | _ ->
+    | Some hc ->
+      if equal k hc.node then Ok hc
+      else locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i'
+    | None ->
       (* When a value has been erased by the GC (case [None]), we must
          keep looking further for another value with the same hash. It
          would be incorrect to treat it as a [void] hash, for the same
          reason that François distinguishes [tomb] from [void]. *)
-      locate_gen_loop ~equal ~mask ~travel keys k hashes h i'
+      let first_dead = if first_dead < 0 then i else first_dead in
+      locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i'
 
 let next_sz n = min (2*n) (Sys.max_array_length / 2)
 
@@ -179,8 +186,9 @@ let resize_gen ~equal t =
       match locate_gen ~equal t hc.node h with
       | Ok _ ->
         failwith "resize: key already in the table?";
-      | Error i ->
-        t.occupation <- t.occupation + 1;
+      | Error (i, void_or_dead) ->
+        if void_or_dead then
+          t.occupation <- t.occupation + 1;
         Weak.set new_keys i (Some hc);
         new_hashes.(i) <- h;
   done;
@@ -208,7 +216,8 @@ let compress ~equal t =
       | Some hc ->
         match locate_gen ~equal t hc.node h with
         | Ok _ -> ()
-        | Error j ->
+        | Error (j, void_or_dead) ->
+          if verbose then assert void_or_dead;
           Weak.set t.keys j (Some hc);
           Weak.set t.keys i None;
           t.hashes.(j) <- t.hashes.(i);
@@ -283,12 +292,13 @@ let hashcons_gen ~hash ~equal t k =
   | Ok hc ->
     if verbose then incr hits;
     hc
-  | Error i ->
+  | Error (i, void_or_dead) ->
     if verbose then incr misses;
     let hc = { hkey; tag = gentag (); node = k } in
     Weak.set t.keys i (Some hc);
     Array.unsafe_set t.hashes i h;
-    t.occupation <- t.occupation + 1;
+    if void_or_dead then
+      t.occupation <- t.occupation + 1;
     hc
 
 let stats t =
