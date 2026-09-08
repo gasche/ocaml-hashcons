@@ -87,7 +87,6 @@ type 'a t = {
   mutable occupation : int;
   mutable mask : int; (* Array.length hashes - 1
     (note: the length must be a power of two) *)
-  travel : int ref;
 }
 
 let create sz =
@@ -103,7 +102,6 @@ let create sz =
     keys = Weak.create sz;
     occupation = 0;
     mask = sz - 1;
-    travel = ref 0;
   }
 
 let clear t =
@@ -132,10 +130,9 @@ let rec locate_gen ~equal t k h =
   if verbose then incr locate_calls;
   let i = (h : H.t :> int) land t.mask in
   locate_gen_loop
-    ~equal ~mask:t.mask ~travel:t.travel
+    ~equal ~mask:t.mask
     t.keys k t.hashes h ~first_dead:(-1) i
-and locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i =
-  incr travel;
+and locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i =
   if verbose then incr locate_travel;
   let h' = Array.unsafe_get hashes i in
   let i' = (i + 1) land mask in
@@ -144,20 +141,20 @@ and locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i =
       let i = if first_dead < 0 then i else first_dead in
       Error (i, first_dead < 0)
     end
-    else locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i'
+    else locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i'
   else
     match Weak.get keys i with
     | Some hc when equal k hc.node -> Ok hc
     | Some hc ->
       if equal k hc.node then Ok hc
-      else locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i'
+      else locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i'
     | None ->
       (* When a value has been erased by the GC (case [None]), we must
          keep looking further for another value with the same hash. It
          would be incorrect to treat it as a [void] hash, for the same
          reason that François distinguishes [tomb] from [void]. *)
       let first_dead = if first_dead < 0 then i else first_dead in
-      locate_gen_loop ~equal ~mask ~travel keys k hashes h ~first_dead i'
+      locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i'
 
 let next_sz n = min (2*n) (Sys.max_array_length / 2)
 
@@ -265,26 +262,6 @@ let hashcons_gen ~hash ~equal t k =
     if real_occupation < capacity t / 2
     then compress ~equal t
     else resize_gen ~equal t;
-    t.travel := 0;
-  end
-  else if !(t.travel) > 42 * capacity t then begin
-    (* In workloads where hits dominate misses, the table grows very
-       slowly, so the crowded criterion rarely applies. It remains
-       useful to compress it from time to time, to get a chance to
-       remove collected values and thus speedup future lookups.
-
-       To compress regularly, we measure the 'travel' caused by
-       lookups, the total number of positions they have visited since
-       the last resizing or compression. When they have visited many
-       times the total size of the structure, we have amortized the
-       cost of a compression.
-
-       On [test_qs.ml] from the [ocaml-hashcons] repository (99.8%
-       hit rate), this extra source of compression reduces average
-       lookup travel from 5.4 to 1.3, and runtime is reduced from 1.7s
-       to 1.3s. *)
-    compress ~equal t;
-    t.travel := 0;
   end;
   let hkey = hash k in
   let h = H.of_int hkey in
