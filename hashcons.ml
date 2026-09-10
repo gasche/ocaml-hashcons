@@ -126,6 +126,13 @@ let () = if verbose then at_exit (fun () ->
     (float !locate_travel /. float !locate_calls)
 )
 
+(* The result of [locate] functions: either we found an equal
+   element at a certain position, or we stopped on a void or dead slot. *)
+type 'a finding =
+| Found of 'a
+| Void of int
+| Dead of int
+
 let rec locate_gen ~equal t k h =
   if verbose then incr locate_calls;
   let i = (h : H.t :> int) land t.mask in
@@ -138,15 +145,14 @@ and locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i =
   let i' = (i + 1) land mask in
   if h' <> h then
     if h' = H.void then begin
-      let i = if first_dead < 0 then i else first_dead in
-      Error (i, first_dead < 0)
+      if first_dead < 0 then Void i else Dead first_dead
     end
     else locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i'
   else
     match Weak.get keys i with
-    | Some hc when equal k hc.node -> Ok hc
+    | Some hc when equal k hc.node -> Found hc
     | Some hc ->
-      if equal k hc.node then Ok hc
+      if equal k hc.node then Found hc
       else locate_gen_loop ~equal ~mask keys k hashes h ~first_dead i'
     | None ->
       (* When a value has been erased by the GC (case [None]), we must
@@ -181,11 +187,14 @@ let resize_gen ~equal t =
     | Some hc ->
       let h = Array.unsafe_get old_hashes i in
       match locate_gen ~equal t hc.node h with
-      | Ok _ ->
+      | Found _ ->
         failwith "resize: key already in the table?";
-      | Error (i, void_or_dead) ->
-        if void_or_dead then
-          t.occupation <- t.occupation + 1;
+      | Void i ->
+        t.occupation <- t.occupation + 1;
+        Weak.set new_keys i (Some hc);
+        new_hashes.(i) <- h;
+      | Dead i ->
+        (* reusing a dead slot: no occupation increase *)
         Weak.set new_keys i (Some hc);
         new_hashes.(i) <- h;
   done;
@@ -212,9 +221,11 @@ let compress ~equal t =
         t.hashes.(i) <- H.void;
       | Some hc ->
         match locate_gen ~equal t hc.node h with
-        | Ok _ -> ()
-        | Error (j, void_or_dead) ->
-          if verbose then assert void_or_dead;
+        | Found _ -> ()
+        | Dead _ ->
+          (* we cannot encounter dead slots during compression! *)
+          assert false
+        | Void j ->
           Weak.set t.keys j (Some hc);
           Weak.set t.keys i None;
           t.hashes.(j) <- t.hashes.(i);
@@ -266,16 +277,18 @@ let hashcons_gen ~hash ~equal t k =
   let hkey = hash k in
   let h = H.of_int hkey in
   match locate_gen ~equal t k h with
-  | Ok hc ->
+  | Found hc ->
     if verbose then incr hits;
     hc
-  | Error (i, void_or_dead) ->
+  | (Void i | Dead i) as finding ->
     if verbose then incr misses;
     let hc = { hkey; tag = gentag (); node = k } in
     Weak.set t.keys i (Some hc);
     Array.unsafe_set t.hashes i h;
-    if void_or_dead then
-      t.occupation <- t.occupation + 1;
+    (match finding with
+     | Void _ ->
+       t.occupation <- t.occupation + 1
+     | _ -> ());
     hc
 
 let stats t =
